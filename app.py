@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import time
 
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error
@@ -32,25 +33,26 @@ st.markdown(
 
 st.title("📈 Inflation Forecasting (CPI) + Financial News Sentiment")
 st.markdown(
-    "<div class='muted'>Walk-forward backtesting • XGBoost regression • Optional SHAP explainability • Downloadable forecasts</div>",
+    "<div class='muted'>Walk-forward backtesting • XGBoost regression • Optional SHAP • Downloadable forecasts</div>",
     unsafe_allow_html=True
 )
 st.write("")
 
+# Detect if running on Streamlit Cloud
+IS_CLOUD = bool(st.secrets.get("STREAMLIT_CLOUD", "")) if hasattr(st, "secrets") else False
+
 
 # =========================
-# HELPERS
+# DATA LOADERS
 # =========================
 @st.cache_data(show_spinner=False)
 def load_cpi(start_date: str = "2015-01-01") -> pd.DataFrame:
-    # FRED direct CSV endpoint
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPIAUCSL"
     cpi = pd.read_csv(url)
     cpi.columns = ["date", "cpi"]
     cpi["date"] = pd.to_datetime(cpi["date"])
     cpi = cpi[cpi["date"] >= pd.to_datetime(start_date)].copy()
 
-    # YoY inflation
     cpi["inflation_yoy"] = cpi["cpi"].pct_change(12, fill_method=None)
     cpi = cpi.dropna().sort_values("date").reset_index(drop=True)
     return cpi
@@ -69,10 +71,8 @@ def load_monthly_sentiment(uploaded_file) -> pd.DataFrame:
 def make_features(df: pd.DataFrame, horizon: int, n_lags: int):
     df = df.copy().sort_values("date").reset_index(drop=True)
 
-    # Predict future inflation
     df["target"] = df["inflation_yoy"].shift(-horizon)
 
-    # Lags
     for l in range(1, n_lags + 1):
         df[f"infl_lag{l}"] = df["inflation_yoy"].shift(l)
         df[f"sentiment_lag{l}"] = df["sentiment"].shift(l)
@@ -84,42 +84,35 @@ def make_features(df: pd.DataFrame, horizon: int, n_lags: int):
         + [f"sentiment_lag{l}" for l in range(1, n_lags + 1)]
         + [f"infl_lag{l}" for l in range(1, n_lags + 1)]
     )
-
     X = df[feature_cols]
     y = df["target"]
     return df, X, y, feature_cols
 
 
-def walk_forward_oof(X, y, params, n_splits=5):
+# =========================
+# FAST WALK-FORWARD (WITH PROGRESS)
+# =========================
+def walk_forward_oof_fast(X, y, params, n_splits=5):
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    oof = np.zeros(len(y))
+    oof = np.full(len(y), np.nan)
 
-    for train_idx, test_idx in tscv.split(X):
+    prog = st.progress(0)
+    status = st.empty()
+    t0 = time.time()
+
+    splits = list(tscv.split(X))
+    total = len(splits)
+
+    for k, (train_idx, test_idx) in enumerate(splits, start=1):
+        status.write(f"Training fold {k}/{total} ...")
         model = xgb.XGBRegressor(**params)
         model.fit(X.iloc[train_idx], y.iloc[train_idx])
         oof[test_idx] = model.predict(X.iloc[test_idx])
 
+        prog.progress(int(100 * k / total))
+
+    status.write(f"✅ Done in {time.time() - t0:.1f}s")
     return oof
-
-
-@st.cache_data(show_spinner=False)
-def run_backtest_cached(X_df: pd.DataFrame, y_ser: pd.Series, params: dict, n_splits: int):
-    """
-    Cache backtest results so Streamlit Cloud doesn't retrain on every rerun.
-    """
-    oof = walk_forward_oof(X_df, y_ser, params=params, n_splits=n_splits)
-    mae = mean_absolute_error(y_ser, oof)
-    return oof, mae
-
-
-@st.cache_resource(show_spinner=False)
-def train_final_model_cached(X_df: pd.DataFrame, y_ser: pd.Series, params: dict):
-    """
-    Cache trained model object (resource cache).
-    """
-    m = xgb.XGBRegressor(**params)
-    m.fit(X_df, y_ser)
-    return m
 
 
 # =========================
@@ -136,10 +129,10 @@ with st.sidebar:
     st.header("Forecast Setup")
     horizon = st.slider("Forecast horizon (months ahead)", 1, 12, 1)
     n_lags = st.slider("Number of lags (inflation + sentiment)", 0, 12, 1)
-    n_splits = st.slider("Walk-forward folds", 3, 10, 5)
+    n_splits = st.slider("Walk-forward folds", 2, 8, 3)
 
     st.header("XGBoost Params")
-    n_estimators = st.slider("n_estimators", 100, 2000, 500, step=50)
+    n_estimators = st.slider("n_estimators", 50, 2000, 300, step=50)
     max_depth = st.slider("max_depth", 2, 10, 3)
     learning_rate = st.number_input("learning_rate", 0.01, 0.3, 0.05, step=0.01)
     subsample = st.slider("subsample", 0.5, 1.0, 0.9)
@@ -147,7 +140,7 @@ with st.sidebar:
     random_state = st.number_input("random_state", value=42, step=1)
 
     st.header("Explainability")
-    run_shap = st.checkbox("Compute SHAP (slower on cloud)", value=False)
+    run_shap = st.checkbox("Compute SHAP (slow)", value=False)
 
     run_btn = st.button("🚀 Run backtest")
 
@@ -159,54 +152,86 @@ if not sentiment_file:
     st.info("Upload your **monthly sentiment CSV** to begin.")
     st.stop()
 
-if not run_btn:
+if run_btn:
+    # Clear previous results
+    st.session_state.pop("results", None)
+
+    with st.spinner("Loading CPI + sentiment and building features..."):
+        cpi = load_cpi(start_date=start_date)
+        sent = load_monthly_sentiment(sentiment_file)
+
+        df = pd.merge(
+            cpi[["date", "inflation_yoy"]],
+            sent[["date", "sentiment"]],
+            on="date",
+            how="inner"
+        ).dropna().sort_values("date").reset_index(drop=True)
+
+        df_feat, X, y, feature_cols = make_features(df, horizon=horizon, n_lags=n_lags)
+
+    st.success(f"Dataset ready ✅ Rows: {len(df_feat)} | Features: {len(feature_cols)}")
+    st.write("**Features:**", feature_cols)
+
+    # -------- FAST BACKTEST PARAMS (caps trees to avoid cloud hanging) --------
+    fast_params = dict(
+        n_estimators=min(int(n_estimators), 200),  # cap trees for backtest speed
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        objective="reg:squarederror",
+        random_state=int(random_state),
+    )
+
+    # -------- FULL FINAL MODEL PARAMS (uses chosen n_estimators) -------------
+    full_params = dict(
+        n_estimators=int(n_estimators),
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        objective="reg:squarederror",
+        random_state=int(random_state),
+    )
+
+    st.subheader("Walk-forward backtest (fast mode)")
+    oof = walk_forward_oof_fast(X, y, params=fast_params, n_splits=n_splits)
+    mae = mean_absolute_error(y, oof)
+
+    st.session_state["results"] = {
+        "df_feat": df_feat,
+        "X": X,
+        "y": y,
+        "feature_cols": feature_cols,
+        "oof": oof,
+        "mae": mae,
+        "full_params": full_params
+    }
+
+# Show results if available
+if "results" not in st.session_state:
     st.warning("Adjust settings in the sidebar and click **Run backtest**.")
     st.stop()
 
+res = st.session_state["results"]
+df_feat = res["df_feat"]
+X = res["X"]
+y = res["y"]
+feature_cols = res["feature_cols"]
+oof = res["oof"]
+mae = res["mae"]
+full_params = res["full_params"]
 
-# -------------------------
-# Load + merge data
-# -------------------------
-with st.spinner("Loading CPI (FRED) + sentiment and building features..."):
-    cpi = load_cpi(start_date=start_date)
-    sent = load_monthly_sentiment(sentiment_file)
+# =========================
+# FINAL MODEL (FULL)
+# =========================
+with st.spinner("Training final model (full params)..."):
+    final_model = xgb.XGBRegressor(**full_params)
+    final_model.fit(X, y)
 
-    df = pd.merge(
-        cpi[["date", "inflation_yoy"]],
-        sent[["date", "sentiment"]],
-        on="date",
-        how="inner"
-    ).dropna().sort_values("date").reset_index(drop=True)
-
-    df_feat, X, y, feature_cols = make_features(df, horizon=horizon, n_lags=n_lags)
-
-st.success(f"Dataset ready ✅ Rows: {len(df_feat)} | Features: {len(feature_cols)}")
-st.write("**Features:**", feature_cols)
-
-params = dict(
-    n_estimators=n_estimators,
-    max_depth=max_depth,
-    learning_rate=learning_rate,
-    subsample=subsample,
-    colsample_bytree=colsample_bytree,
-    objective="reg:squarederror",
-    random_state=int(random_state),
-)
-
-# -------------------------
-# Walk-forward backtest (CACHED)
-# -------------------------
-with st.spinner("Running walk-forward validation..."):
-    oof, mae = run_backtest_cached(X, y, params=params, n_splits=n_splits)
-
-# -------------------------
-# Train final model (CACHED)
-# -------------------------
-final_model = train_final_model_cached(X, y, params)
-
-# -------------------------
-# KPI cards
-# -------------------------
+# =========================
+# KPI CARDS
+# =========================
 k1, k2, k3 = st.columns(3)
 
 with k1:
@@ -238,9 +263,9 @@ with k3:
 
 st.write("")
 
-# -------------------------
-# Table + backtest plot
-# -------------------------
+# =========================
+# TABLE + PLOT
+# =========================
 col1, col2 = st.columns([1, 1])
 
 with col1:
@@ -260,18 +285,16 @@ with col2:
     plt.tight_layout()
     st.pyplot(fig, use_container_width=True)
 
-# -------------------------
-# Future forecast
-# -------------------------
+# =========================
+# FUTURE FORECAST
+# =========================
 st.subheader("🔮 Next Inflation Forecast")
-latest_X = X.iloc[[-1]]
-future_pred = float(final_model.predict(latest_X)[0])
+future_pred = float(final_model.predict(X.iloc[[-1]])[0])
 st.metric(label=f"Predicted YoY Inflation (t+{horizon})", value=f"{future_pred:.4f}")
-st.caption("Uses the latest available feature row in your merged dataset.")
 
-# -------------------------
-# Feature importance chart
-# -------------------------
+# =========================
+# FEATURE IMPORTANCE
+# =========================
 st.subheader("📊 Feature Importance (XGBoost)")
 imp = final_model.feature_importances_
 imp_df = pd.DataFrame({"feature": feature_cols, "importance": imp}).sort_values("importance", ascending=False)
@@ -284,86 +307,33 @@ plt.title("XGBoost Feature Importance")
 plt.tight_layout()
 st.pyplot(fig_imp, use_container_width=True)
 
-# -------------------------
-# Error-over-time chart
-# -------------------------
-st.subheader("📉 Prediction Error Over Time")
-errors = (y.values - oof)
-fig_err = plt.figure(figsize=(10, 4))
-plt.plot(df_feat["date"], errors)
-plt.axhline(0, linestyle="--")
-plt.title("Prediction Error (Actual − Predicted)")
-plt.xlabel("Date")
-plt.ylabel("Error")
-plt.grid(True, alpha=0.25)
-plt.tight_layout()
-st.pyplot(fig_err, use_container_width=True)
-
-# -------------------------
-# SHAP (OPTIONAL)
-# -------------------------
+# =========================
+# OPTIONAL SHAP
+# =========================
 st.subheader("🔍 Explainability (SHAP)")
-
 if run_shap:
-    with st.spinner("Computing SHAP values (can take 30–90s on cloud)..."):
+    with st.spinner("Computing SHAP values..."):
         explainer = shap.TreeExplainer(final_model)
         shap_values = explainer.shap_values(X)
 
-    shap_col1, shap_col2 = st.columns([1, 1])
+    fig_bar = plt.figure()
+    shap.summary_plot(shap_values, X, plot_type="bar", show=False)
+    st.pyplot(fig_bar, use_container_width=True)
 
-    with shap_col1:
-        st.caption("Global feature importance (mean |SHAP|)")
-        fig_bar = plt.figure()
-        shap.summary_plot(shap_values, X, plot_type="bar", show=False)
-        st.pyplot(fig_bar, use_container_width=True)
-
-    with shap_col2:
-        st.caption("SHAP beeswarm (direction + magnitude)")
-        fig_swarm = plt.figure()
-        shap.summary_plot(shap_values, X, show=False)
-        st.pyplot(fig_swarm, use_container_width=True)
-
-    # Plain-English interpretation
-    st.subheader("🧠 Model Interpretation (Plain English)")
-    mean_abs_shap = np.abs(shap_values).mean(axis=0)
-    importance_df = pd.DataFrame({
-        "feature": feature_cols,
-        "mean_abs_shap": mean_abs_shap
-    }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
-
-    top_feature = importance_df.loc[0, "feature"]
-    st.write(f"**Most influential feature:** `{top_feature}`")
-
-    if "infl_lag" in top_feature:
-        st.write("→ The model relies heavily on **inflation persistence** (past inflation predicting future inflation).")
-    elif "sentiment" in top_feature:
-        st.write("→ The model relies heavily on **financial news sentiment** signals.")
-
-    # Directional takeaway for sentiment
-    if "sentiment" in feature_cols:
-        sent_idx = feature_cols.index("sentiment")
-        corr = np.corrcoef(X["sentiment"].values, shap_values[:, sent_idx])[0, 1]
-        if np.isfinite(corr):
-            if corr > 0:
-                st.write("**Direction:** Higher (more positive) sentiment generally pushes predictions **up**.")
-            elif corr < 0:
-                st.write("**Direction:** Higher (more positive) sentiment generally pushes predictions **down**.")
-            else:
-                st.write("**Direction:** Sentiment effect is mixed/neutral on average.")
-
-    st.dataframe(importance_df.head(10))
-
+    fig_swarm = plt.figure()
+    shap.summary_plot(shap_values, X, show=False)
+    st.pyplot(fig_swarm, use_container_width=True)
 else:
-    st.info("SHAP is OFF to keep the cloud app fast. Turn on **Compute SHAP** in the sidebar if you want explanations.")
+    st.info("Turn on SHAP in the sidebar if you want explainability (slower).")
 
-# -------------------------
-# Download results
-# -------------------------
+# =========================
+# DOWNLOAD
+# =========================
 st.subheader("📌 Download results")
 out = df_feat[["date"]].copy()
 out["actual_target"] = y.values
 out["pred_oof"] = oof
-out["error"] = errors
+out["error"] = y.values - oof
 
 st.download_button(
     "Download predictions CSV",
