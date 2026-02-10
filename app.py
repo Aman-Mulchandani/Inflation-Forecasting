@@ -8,11 +8,11 @@ from sklearn.metrics import mean_absolute_error
 import xgboost as xgb
 import shap
 
-# =========================
-# PAGE CONFIG + STYLE
-# =========================
 st.set_page_config(page_title="Inflation Forecasting Dashboard", layout="wide")
 
+# =========================
+# STYLE
+# =========================
 st.markdown(
     """
     <style>
@@ -25,7 +25,6 @@ st.markdown(
       }
       .muted { color: rgba(255,255,255,0.65); font-size: 0.9rem; }
       .small { font-size: 0.85rem; }
-      .section { margin-top: 0.3rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -33,7 +32,7 @@ st.markdown(
 
 st.title("📈 Inflation Forecasting (CPI) + Financial News Sentiment")
 st.markdown(
-    "<div class='muted'>Walk-forward backtesting • XGBoost regression • SHAP explainability • Downloadable forecasts</div>",
+    "<div class='muted'>Walk-forward backtesting • XGBoost regression • Optional SHAP explainability • Downloadable forecasts</div>",
     unsafe_allow_html=True
 )
 st.write("")
@@ -103,6 +102,26 @@ def walk_forward_oof(X, y, params, n_splits=5):
     return oof
 
 
+@st.cache_data(show_spinner=False)
+def run_backtest_cached(X_df: pd.DataFrame, y_ser: pd.Series, params: dict, n_splits: int):
+    """
+    Cache backtest results so Streamlit Cloud doesn't retrain on every rerun.
+    """
+    oof = walk_forward_oof(X_df, y_ser, params=params, n_splits=n_splits)
+    mae = mean_absolute_error(y_ser, oof)
+    return oof, mae
+
+
+@st.cache_resource(show_spinner=False)
+def train_final_model_cached(X_df: pd.DataFrame, y_ser: pd.Series, params: dict):
+    """
+    Cache trained model object (resource cache).
+    """
+    m = xgb.XGBRegressor(**params)
+    m.fit(X_df, y_ser)
+    return m
+
+
 # =========================
 # SIDEBAR
 # =========================
@@ -126,6 +145,9 @@ with st.sidebar:
     subsample = st.slider("subsample", 0.5, 1.0, 0.9)
     colsample_bytree = st.slider("colsample_bytree", 0.5, 1.0, 0.9)
     random_state = st.number_input("random_state", value=42, step=1)
+
+    st.header("Explainability")
+    run_shap = st.checkbox("Compute SHAP (slower on cloud)", value=False)
 
     run_btn = st.button("🚀 Run backtest")
 
@@ -172,11 +194,15 @@ params = dict(
 )
 
 # -------------------------
-# Walk-forward backtest
+# Walk-forward backtest (CACHED)
 # -------------------------
 with st.spinner("Running walk-forward validation..."):
-    oof = walk_forward_oof(X, y, params=params, n_splits=n_splits)
-    mae = mean_absolute_error(y, oof)
+    oof, mae = run_backtest_cached(X, y, params=params, n_splits=n_splits)
+
+# -------------------------
+# Train final model (CACHED)
+# -------------------------
+final_model = train_final_model_cached(X, y, params)
 
 # -------------------------
 # KPI cards
@@ -212,9 +238,8 @@ with k3:
 
 st.write("")
 
-
 # -------------------------
-# Layout: Table + Pred plot
+# Table + backtest plot
 # -------------------------
 col1, col2 = st.columns([1, 1])
 
@@ -235,88 +260,19 @@ with col2:
     plt.tight_layout()
     st.pyplot(fig, use_container_width=True)
 
-
-# =========================
-# Train final model + SHAP
-# =========================
-st.subheader("🔍 Explainability (SHAP)")
-
-with st.spinner("Training final model + computing SHAP values..."):
-    final_model = xgb.XGBRegressor(**params)
-    final_model.fit(X, y)
-
-    explainer = shap.TreeExplainer(final_model)
-    shap_values = explainer.shap_values(X)
-
-shap_col1, shap_col2 = st.columns([1, 1])
-
-with shap_col1:
-    st.caption("Global feature importance (mean |SHAP|)")
-    fig_bar = plt.figure()
-    shap.summary_plot(shap_values, X, plot_type="bar", show=False)
-    st.pyplot(fig_bar, use_container_width=True)
-
-with shap_col2:
-    st.caption("SHAP beeswarm (direction + magnitude)")
-    fig_swarm = plt.figure()
-    shap.summary_plot(shap_values, X, show=False)
-    st.pyplot(fig_swarm, use_container_width=True)
-
-
-# =========================
-# Plain-English SHAP interpretation
-# =========================
-st.subheader("🧠 Model Interpretation (Plain English)")
-
-mean_abs_shap = np.abs(shap_values).mean(axis=0)
-importance_df = pd.DataFrame({
-    "feature": feature_cols,
-    "mean_abs_shap": mean_abs_shap
-}).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
-
-top_feature = importance_df.loc[0, "feature"]
-second_feature = importance_df.loc[1, "feature"] if len(importance_df) > 1 else None
-
-st.write(f"**Most influential feature:** `{top_feature}`")
-if "infl_lag" in top_feature:
-    st.write("→ The model relies heavily on **inflation persistence** (past inflation predicting future inflation).")
-elif "sentiment" in top_feature:
-    st.write("→ The model relies heavily on **financial news sentiment** signals.")
-
-if second_feature:
-    st.write(f"**Second most influential feature:** `{second_feature}`")
-
-# Simple directional takeaway for sentiment:
-if "sentiment" in feature_cols:
-    sent_idx = feature_cols.index("sentiment")
-    corr = np.corrcoef(X["sentiment"].values, shap_values[:, sent_idx])[0, 1]
-    if np.isfinite(corr):
-        if corr > 0:
-            st.write("**Direction:** Higher (more positive) sentiment generally pushes predictions **up**.")
-        elif corr < 0:
-            st.write("**Direction:** Higher (more positive) sentiment generally pushes predictions **down**.")
-        else:
-            st.write("**Direction:** Sentiment effect is mixed/neutral on average.")
-
-st.dataframe(importance_df.head(10))
-
-
-# =========================
-# Future forecast (next period prediction)
-# =========================
+# -------------------------
+# Future forecast
+# -------------------------
 st.subheader("🔮 Next Inflation Forecast")
-
 latest_X = X.iloc[[-1]]
 future_pred = float(final_model.predict(latest_X)[0])
 st.metric(label=f"Predicted YoY Inflation (t+{horizon})", value=f"{future_pred:.4f}")
-st.caption("This forecast uses the latest available feature row in your merged dataset.")
+st.caption("Uses the latest available feature row in your merged dataset.")
 
-
-# =========================
-# XGBoost feature importance chart
-# =========================
+# -------------------------
+# Feature importance chart
+# -------------------------
 st.subheader("📊 Feature Importance (XGBoost)")
-
 imp = final_model.feature_importances_
 imp_df = pd.DataFrame({"feature": feature_cols, "importance": imp}).sort_values("importance", ascending=False)
 
@@ -328,12 +284,10 @@ plt.title("XGBoost Feature Importance")
 plt.tight_layout()
 st.pyplot(fig_imp, use_container_width=True)
 
-
-# =========================
+# -------------------------
 # Error-over-time chart
-# =========================
+# -------------------------
 st.subheader("📉 Prediction Error Over Time")
-
 errors = (y.values - oof)
 fig_err = plt.figure(figsize=(10, 4))
 plt.plot(df_feat["date"], errors)
@@ -345,12 +299,67 @@ plt.grid(True, alpha=0.25)
 plt.tight_layout()
 st.pyplot(fig_err, use_container_width=True)
 
+# -------------------------
+# SHAP (OPTIONAL)
+# -------------------------
+st.subheader("🔍 Explainability (SHAP)")
 
-# =========================
+if run_shap:
+    with st.spinner("Computing SHAP values (can take 30–90s on cloud)..."):
+        explainer = shap.TreeExplainer(final_model)
+        shap_values = explainer.shap_values(X)
+
+    shap_col1, shap_col2 = st.columns([1, 1])
+
+    with shap_col1:
+        st.caption("Global feature importance (mean |SHAP|)")
+        fig_bar = plt.figure()
+        shap.summary_plot(shap_values, X, plot_type="bar", show=False)
+        st.pyplot(fig_bar, use_container_width=True)
+
+    with shap_col2:
+        st.caption("SHAP beeswarm (direction + magnitude)")
+        fig_swarm = plt.figure()
+        shap.summary_plot(shap_values, X, show=False)
+        st.pyplot(fig_swarm, use_container_width=True)
+
+    # Plain-English interpretation
+    st.subheader("🧠 Model Interpretation (Plain English)")
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    importance_df = pd.DataFrame({
+        "feature": feature_cols,
+        "mean_abs_shap": mean_abs_shap
+    }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    top_feature = importance_df.loc[0, "feature"]
+    st.write(f"**Most influential feature:** `{top_feature}`")
+
+    if "infl_lag" in top_feature:
+        st.write("→ The model relies heavily on **inflation persistence** (past inflation predicting future inflation).")
+    elif "sentiment" in top_feature:
+        st.write("→ The model relies heavily on **financial news sentiment** signals.")
+
+    # Directional takeaway for sentiment
+    if "sentiment" in feature_cols:
+        sent_idx = feature_cols.index("sentiment")
+        corr = np.corrcoef(X["sentiment"].values, shap_values[:, sent_idx])[0, 1]
+        if np.isfinite(corr):
+            if corr > 0:
+                st.write("**Direction:** Higher (more positive) sentiment generally pushes predictions **up**.")
+            elif corr < 0:
+                st.write("**Direction:** Higher (more positive) sentiment generally pushes predictions **down**.")
+            else:
+                st.write("**Direction:** Sentiment effect is mixed/neutral on average.")
+
+    st.dataframe(importance_df.head(10))
+
+else:
+    st.info("SHAP is OFF to keep the cloud app fast. Turn on **Compute SHAP** in the sidebar if you want explanations.")
+
+# -------------------------
 # Download results
-# =========================
+# -------------------------
 st.subheader("📌 Download results")
-
 out = df_feat[["date"]].copy()
 out["actual_target"] = y.values
 out["pred_oof"] = oof
@@ -362,6 +371,9 @@ st.download_button(
     file_name="oof_predictions.csv",
     mime="text/csv"
 )
+
+
+
 
 
 
